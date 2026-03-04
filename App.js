@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   StyleSheet,
   Text,
@@ -6,6 +6,7 @@ import {
   TouchableOpacity,
   SafeAreaView,
   Alert,
+  AppState,
 } from 'react-native';
 
 export default function App() {
@@ -18,18 +19,24 @@ export default function App() {
     4: { ...initialTimer },
   });
 
-  const [selected, setSelected] = useState(1); // currently selected timer (1–4)
+  const [selected, setSelected] = useState(1);
 
-  // Recalculate total seconds when h/m/s changes
+  // Track when the timer was last "ticked" or started/paused
+  const lastTickRef = useRef(Date.now());
+  const appStateRef = useRef(AppState.currentState);
+
+  // Recalculate total seconds when h/m/s changes (only when not running)
   useEffect(() => {
     setTimers(prev => {
       const updated = { ...prev };
       Object.keys(updated).forEach(key => {
         const t = updated[key];
-        updated[key] = {
-          ...t,
-          total: t.h * 3600 + t.m * 60 + t.s,
-        };
+        if (!t.running) {
+          updated[key] = {
+            ...t,
+            total: t.h * 3600 + t.m * 60 + t.s,
+          };
+        }
       });
       return updated;
     });
@@ -48,7 +55,67 @@ export default function App() {
     timers[4].s,
   ]);
 
-  // Countdown logic + alert when time is up
+  // Handle app state changes (background ↔ foreground)
+  useEffect(() => {
+    const subscription = AppState.addEventListener('change', nextAppState => {
+      if (
+        appStateRef.current.match(/inactive|background/) &&
+        nextAppState === 'active'
+      ) {
+        // App came back to foreground → catch up the timer
+        const now = Date.now();
+        const elapsedMs = now - lastTickRef.current;
+        const elapsedSec = Math.floor(elapsedMs / 1000);
+
+        setTimers(prev => {
+          const activeKey = Object.keys(prev).find(k => prev[k].running);
+          if (!activeKey) return prev;
+
+          const t = prev[activeKey];
+          let newTotal = Math.max(0, t.total - elapsedSec);
+
+          if (newTotal <= 0) {
+            Alert.alert(
+              "Time's Up!",
+              `Timer T${activeKey} has finished!`,
+              [{ text: 'OK', style: 'default' }],
+              { cancelable: true },
+            );
+            return {
+              ...prev,
+              [activeKey]: { ...initialTimer, running: false },
+            };
+          }
+
+          const newH = Math.floor(newTotal / 3600);
+          const newM = Math.floor((newTotal % 3600) / 60);
+          const newS = newTotal % 60;
+
+          return {
+            ...prev,
+            [activeKey]: {
+              ...t,
+              h: newH,
+              m: newM,
+              s: newS,
+              total: newTotal,
+            },
+          };
+        });
+
+        lastTickRef.current = now; // Reset tick reference
+      } else if (nextAppState === 'background' || nextAppState === 'inactive') {
+        // Going to background → record current time
+        lastTickRef.current = Date.now();
+      }
+
+      appStateRef.current = nextAppState;
+    });
+
+    return () => subscription.remove();
+  }, []);
+
+  // Foreground countdown (runs every second while active & in foreground)
   useEffect(() => {
     let interval = null;
 
@@ -58,17 +125,13 @@ export default function App() {
       interval = setInterval(() => {
         setTimers(prev => {
           const t = prev[activeTimerKey];
-
           if (t.total <= 0) {
-            // Show alert
             Alert.alert(
               "Time's Up!",
               `Timer T${activeTimerKey} has finished!`,
               [{ text: 'OK', style: 'default' }],
               { cancelable: true },
             );
-
-            // Reset this timer
             return {
               ...prev,
               [activeTimerKey]: { ...initialTimer, running: false },
@@ -79,6 +142,8 @@ export default function App() {
           const newH = Math.floor(newTotal / 3600);
           const newM = Math.floor((newTotal % 3600) / 60);
           const newS = newTotal % 60;
+
+          lastTickRef.current = Date.now(); // Update on each tick
 
           return {
             ...prev,
@@ -100,6 +165,8 @@ export default function App() {
   const adjustTime = (unit, delta) => {
     setTimers(prev => {
       const t = prev[selected];
+      if (t.running) return prev; // Optional: prevent changes while running
+
       let newVal = t[unit] + delta;
       if (newVal < 0) newVal = 0;
 
@@ -113,16 +180,21 @@ export default function App() {
   const toggleRunning = () => {
     setTimers(prev => {
       const updated = { ...prev };
-      // Stop all other timers
       Object.keys(updated).forEach(key => {
         if (Number(key) !== selected) {
           updated[key] = { ...updated[key], running: false };
         }
       });
       const current = updated[selected];
+      const willRun = !current.running;
+
+      if (willRun) {
+        lastTickRef.current = Date.now(); // Reset tick on start
+      }
+
       return {
         ...updated,
-        [selected]: { ...current, running: !current.running },
+        [selected]: { ...current, running: willRun },
       };
     });
   };
@@ -141,19 +213,16 @@ export default function App() {
 
   return (
     <SafeAreaView style={styles.container}>
-      {/* Status */}
       <Text style={styles.status}>
         {current.running ? `TIMER T${selected} ACTIVE` : 'IDLE'}
       </Text>
 
-      {/* Display */}
       <View style={styles.lcd}>
         <Text style={styles.lcdText}>
           {displayH}:{displayM}:{displayS}
         </Text>
       </View>
 
-      {/* Timer selection (T1–T4) */}
       <View style={styles.row}>
         {[1, 2, 3, 4].map(num => (
           <TouchableOpacity
@@ -166,7 +235,6 @@ export default function App() {
         ))}
       </View>
 
-      {/* Seconds +/- */}
       <View style={styles.row}>
         <TouchableOpacity onPress={() => adjustTime('s', 1)} style={styles.btn}>
           <Text style={styles.white}>Sec +</Text>
@@ -179,7 +247,6 @@ export default function App() {
         </TouchableOpacity>
       </View>
 
-      {/* Minutes +/- */}
       <View style={styles.row}>
         <TouchableOpacity onPress={() => adjustTime('m', 1)} style={styles.btn}>
           <Text style={styles.white}>Min +</Text>
@@ -192,7 +259,6 @@ export default function App() {
         </TouchableOpacity>
       </View>
 
-      {/* Hours +/- */}
       <View style={styles.row}>
         <TouchableOpacity onPress={() => adjustTime('h', 1)} style={styles.btn}>
           <Text style={styles.white}>Hr +</Text>
@@ -205,7 +271,6 @@ export default function App() {
         </TouchableOpacity>
       </View>
 
-      {/* Clear & Start/Stop */}
       <View style={styles.row}>
         <TouchableOpacity onPress={clearTimer} style={styles.btnClear}>
           <Text style={styles.white}>CLEAR</Text>
@@ -225,6 +290,7 @@ export default function App() {
   );
 }
 
+// Styles remain the same as before
 const styles = StyleSheet.create({
   container: {
     flex: 1,
