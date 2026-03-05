@@ -17,7 +17,14 @@ import notifee, {
 Sound.setCategory('Playback');
 
 export default function App() {
-  const initialTimer = { h: 0, m: 0, s: 0, running: false, total: 0 };
+  const initialTimer = {
+    h: 0,
+    m: 0,
+    s: 0,
+    running: false,
+    total: 0,
+    alarm: false,
+  };
   const [timers, setTimers] = useState({
     1: { ...initialTimer },
     2: { ...initialTimer },
@@ -25,45 +32,13 @@ export default function App() {
     4: { ...initialTimer },
   });
   const [selected, setSelected] = useState(1);
+  const [isBlinkVisible, setIsBlinkVisible] = useState(true);
+
   const lastTickRef = useRef(Date.now());
   const appStateRef = useRef(AppState.currentState);
   const beepSoundRef = useRef(null);
 
-  // --- SOUND & NOTIFICATION ---
-  const playBeep = () => {
-    if (beepSoundRef.current) {
-      beepSoundRef.current.setNumberOfLoops(-1);
-      beepSoundRef.current.play();
-    }
-  };
-
-  const stopBeep = () => {
-    if (beepSoundRef.current) beepSoundRef.current.stop();
-    notifee.cancelAllNotifications();
-  };
-
-  const scheduleNotification = async (seconds, timerId) => {
-    const trigger = {
-      type: TriggerType.TIMESTAMP,
-      timestamp: Date.now() + seconds * 1000,
-    };
-    await notifee.createTriggerNotification(
-      {
-        id: `timer-${timerId}`,
-        title: `Timer T${timerId} Finished`,
-        body: 'Industrial Alert: Time is up!',
-        android: {
-          channelId: 'timer-channel',
-          category: AndroidCategory.ALARM,
-          importance: AndroidImportance.HIGH,
-          sound: 'beep',
-          looping: true,
-        },
-      },
-      trigger,
-    );
-  };
-
+  // Initial Setup
   useEffect(() => {
     beepSoundRef.current = new Sound('beep.wav', Sound.MAIN_BUNDLE);
     const setupNotifee = async () => {
@@ -80,24 +55,37 @@ export default function App() {
     };
   }, []);
 
-  // --- MULTI-TIMER INDEPENDENT COUNTDOWN ---
+  // Blinking Effect (500ms)
+  useEffect(() => {
+    const blinkInterval = setInterval(() => {
+      setIsBlinkVisible(prev => !prev);
+    }, 500);
+    return () => clearInterval(blinkInterval);
+  }, []);
+
+  // Countdown Loop
   useEffect(() => {
     const interval = setInterval(() => {
       setTimers(prev => {
         const updated = { ...prev };
         let stateChanged = false;
-
         Object.keys(updated).forEach(key => {
           const t = updated[key];
           if (t.running) {
             stateChanged = true;
             if (t.total <= 1) {
-              // Timer finished
               notifee.cancelNotification(`timer-${key}`);
               playBeep();
-              updated[key] = { ...initialTimer, running: false };
+              updated[key] = {
+                ...t,
+                running: false,
+                total: 0,
+                h: 0,
+                m: 0,
+                s: 0,
+                alarm: true,
+              };
             } else {
-              // Decrement
               const newTotal = t.total - 1;
               updated[key] = {
                 ...t,
@@ -109,65 +97,50 @@ export default function App() {
             }
           }
         });
-
         return stateChanged ? updated : prev;
       });
     }, 1000);
-
     return () => clearInterval(interval);
   }, []);
 
-  // --- APP STATE CATCH-UP ---
-  useEffect(() => {
-    const subscription = AppState.addEventListener(
-      'change',
-      async nextAppState => {
-        if (
-          appStateRef.current.match(/inactive|background/) &&
-          nextAppState === 'active'
-        ) {
-          const elapsedSec = Math.floor(
-            (Date.now() - lastTickRef.current) / 1000,
-          );
+  const playBeep = () => {
+    if (beepSoundRef.current) {
+      beepSoundRef.current.setNumberOfLoops(-1);
+      beepSoundRef.current.play();
+    }
+  };
 
-          setTimers(prev => {
-            const updated = { ...prev };
-            Object.keys(updated).forEach(key => {
-              const t = updated[key];
-              if (t.running) {
-                let newTotal = Math.max(0, t.total - elapsedSec);
-                if (newTotal <= 0) {
-                  stopBeep();
-                  playBeep();
-                  updated[key] = { ...initialTimer, running: false };
-                } else {
-                  updated[key] = {
-                    ...t,
-                    total: newTotal,
-                    h: Math.floor(newTotal / 3600),
-                    m: Math.floor((newTotal % 3600) / 60),
-                    s: newTotal % 60,
-                  };
-                }
-              }
-            });
-            return updated;
-          });
-        }
-        lastTickRef.current = Date.now();
-        appStateRef.current = nextAppState;
-      },
+  // --- CORE CHANGE: FUNCTION TO STOP ALARM ---
+  const stopAlarmLogic = timerId => {
+    // 1. Check if any OTHER timers are still alarming
+    const otherAlarms = Object.keys(timers).some(
+      k => k !== timerId.toString() && timers[k].alarm,
     );
-    return () => subscription.remove();
-  }, []);
 
-  // --- HANDLERS ---
+    // 2. If no other timers are alarming, kill the sound
+    if (!otherAlarms) {
+      if (beepSoundRef.current) beepSoundRef.current.stop();
+      notifee.cancelAllNotifications();
+    }
+
+    // 3. Reset only the alarm state for this specific timer
+    setTimers(prev => ({
+      ...prev,
+      [timerId]: { ...prev[timerId], alarm: false },
+    }));
+  };
+
   const toggleRunning = () => {
     const current = timers[selected];
+
+    // If it's beeping, this button is "STOP ALARM"
+    if (current.alarm) {
+      stopAlarmLogic(selected);
+      return;
+    }
+
+    // Normal Start/Stop toggle
     const willRun = !current.running;
-
-    stopBeep();
-
     if (willRun && current.total > 0) {
       scheduleNotification(current.total, selected);
     } else {
@@ -180,10 +153,44 @@ export default function App() {
     }));
   };
 
+  const clearTimer = () => {
+    const current = timers[selected];
+    // If user clears while alarming, we must stop the sound too
+    if (current.alarm) {
+      stopAlarmLogic(selected);
+    }
+
+    setTimers(prev => ({
+      ...prev,
+      [selected]: { ...initialTimer },
+    }));
+  };
+
+  const scheduleNotification = async (seconds, timerId) => {
+    const trigger = {
+      type: TriggerType.TIMESTAMP,
+      timestamp: Date.now() + seconds * 1000,
+    };
+    await notifee.createTriggerNotification(
+      {
+        id: `timer-${timerId}`,
+        title: `Timer T${timerId} Finished`,
+        body: 'Industrial Alert: Time is up!',
+        android: {
+          channelId: 'timer-channel',
+          importance: AndroidImportance.HIGH,
+          sound: 'beep',
+          looping: true,
+        },
+      },
+      trigger,
+    );
+  };
+
   const adjustTime = (unit, delta) => {
     setTimers(prev => {
       const t = prev[selected];
-      if (t.running) return prev;
+      if (t.running || t.alarm) return prev;
       let newVal = Math.max(0, t[unit] + delta);
       const updated = { ...t, [unit]: newVal };
       updated.total = updated.h * 3600 + updated.m * 60 + updated.s;
@@ -197,10 +204,13 @@ export default function App() {
     const hh = String(current.h).padStart(2, '0');
     const mm = String(current.m).padStart(2, '0');
     const ss = String(current.s).padStart(2, '0');
+    const showRed = current.alarm && isBlinkVisible;
+    const textColor = showRed ? '#FF0000' : '#00FF41';
+
     if (current.h > 0) {
       return (
         <Text
-          style={[styles.lcdText, styles.lcdSmall]}
+          style={[styles.lcdText, styles.lcdSmall, { color: textColor }]}
           numberOfLines={1}
           adjustsFontSizeToFit
         >
@@ -210,7 +220,7 @@ export default function App() {
     }
     return (
       <Text
-        style={[styles.lcdText, styles.lcdLarge]}
+        style={[styles.lcdText, styles.lcdLarge, { color: textColor }]}
         numberOfLines={1}
         adjustsFontSizeToFit
       >
@@ -223,32 +233,49 @@ export default function App() {
     <SafeAreaView style={styles.container}>
       <View style={styles.header}>
         <Text style={styles.status}>
-          T{selected} {current.running ? 'RUNNING' : 'IDLE'}
+          T{selected}{' '}
+          {current.alarm
+            ? '!!! ALARM !!!'
+            : current.running
+            ? 'RUNNING'
+            : 'IDLE'}
         </Text>
-        {/* Indicators for background timers */}
-        <View style={styles.indicatorRow}>
-          {[1, 2, 3, 4].map(n => (
-            <View
-              key={n}
-              style={[styles.dot, timers[n].running && styles.dotActive]}
-            />
-          ))}
-        </View>
       </View>
 
-      <View style={styles.lcd}>{renderTime()}</View>
+      <View
+        style={[
+          styles.lcd,
+          current.alarm && isBlinkVisible && styles.lcdAlarmBorder,
+        ]}
+      >
+        {renderTime()}
+      </View>
 
       <View style={styles.row}>
-        {[1, 2, 3, 4].map(n => (
-          <TouchableOpacity
-            key={n}
-            onPress={() => setSelected(n)}
-            style={[styles.btnSmall, selected === n && styles.btnSelected]}
-          >
-            <Text style={styles.white}>T{n}</Text>
-            {timers[n].running && <View style={styles.runningIndicator} />}
-          </TouchableOpacity>
-        ))}
+        {[1, 2, 3, 4].map(n => {
+          const isAlarming = timers[n].alarm;
+          const isSelected = selected === n;
+          let bgColor = '#444';
+          if (isSelected) bgColor = '#0066cc';
+          if (isAlarming && isBlinkVisible) bgColor = '#FF0000';
+
+          return (
+            <TouchableOpacity
+              key={n}
+              onPress={() => setSelected(n)}
+              style={[
+                styles.btnSmall,
+                { backgroundColor: bgColor },
+                isSelected && styles.btnSelectedBorder,
+              ]}
+            >
+              <Text style={styles.white}>T{n}</Text>
+              {timers[n].running && !timers[n].alarm && (
+                <View style={styles.runningIndicator} />
+              )}
+            </TouchableOpacity>
+          );
+        })}
       </View>
 
       <View style={styles.controlSection}>
@@ -272,13 +299,7 @@ export default function App() {
       </View>
 
       <View style={styles.footerRow}>
-        <TouchableOpacity
-          onPress={() => {
-            stopBeep();
-            setTimers(p => ({ ...p, [selected]: { ...initialTimer } }));
-          }}
-          style={styles.btnClear}
-        >
+        <TouchableOpacity onPress={clearTimer} style={styles.btnClear}>
           <Text style={styles.white}>CLEAR</Text>
         </TouchableOpacity>
 
@@ -286,10 +307,15 @@ export default function App() {
           onPress={toggleRunning}
           style={[
             styles.start,
-            { backgroundColor: current.running ? '#D32F2F' : '#2E7D32' },
+            {
+              backgroundColor:
+                current.running || current.alarm ? '#D32F2F' : '#2E7D32',
+            },
           ]}
         >
-          <Text style={styles.white}>{current.running ? 'STOP' : 'START'}</Text>
+          <Text style={styles.white}>
+            {current.alarm ? 'STOP ALARM' : current.running ? 'STOP' : 'START'}
+          </Text>
         </TouchableOpacity>
       </View>
     </SafeAreaView>
@@ -305,15 +331,6 @@ const styles = StyleSheet.create({
   },
   header: { alignItems: 'center', marginBottom: 10 },
   status: { color: '#AAA', fontSize: 18, fontWeight: 'bold' },
-  indicatorRow: { flexDirection: 'row', marginTop: 5 },
-  dot: {
-    width: 8,
-    height: 8,
-    borderRadius: 4,
-    backgroundColor: '#333',
-    marginHorizontal: 4,
-  },
-  dotActive: { backgroundColor: '#00FF41' },
   lcd: {
     backgroundColor: '#111',
     height: 140,
@@ -325,7 +342,8 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     paddingHorizontal: 10,
   },
-  lcdText: { color: '#00FF41', fontFamily: 'monospace', textAlign: 'center' },
+  lcdAlarmBorder: { borderColor: '#FF0000' },
+  lcdText: { fontFamily: 'monospace', textAlign: 'center' },
   lcdLarge: { fontSize: 90, fontWeight: 'bold' },
   lcdSmall: { fontSize: 65 },
   row: {
@@ -334,25 +352,20 @@ const styles = StyleSheet.create({
     marginBottom: 20,
   },
   btnSmall: {
-    backgroundColor: '#444',
     paddingVertical: 12,
     width: '22%',
     borderRadius: 10,
     alignItems: 'center',
     position: 'relative',
   },
-  btnSelected: {
-    backgroundColor: '#0066cc',
-    borderWidth: 2,
-    borderColor: '#3399ff',
-  },
+  btnSelectedBorder: { borderWidth: 2, borderColor: '#3399ff' },
   runningIndicator: {
     position: 'absolute',
     top: 5,
     right: 5,
-    width: 6,
-    height: 6,
-    borderRadius: 3,
+    width: 8,
+    height: 8,
+    borderRadius: 4,
     backgroundColor: '#00FF41',
   },
   controlSection: { marginBottom: 10 },
@@ -394,5 +407,5 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     borderRadius: 10,
   },
-  white: { color: '#FFF', fontSize: 22, fontWeight: 'bold' },
+  white: { color: '#FFF', fontSize: 18, fontWeight: 'bold' },
 });
