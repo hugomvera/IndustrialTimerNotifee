@@ -5,260 +5,174 @@ import {
   View,
   TouchableOpacity,
   SafeAreaView,
-  Alert,
   AppState,
 } from 'react-native';
+import Sound from 'react-native-sound';
+import notifee, {
+  TimestampTrigger,
+  TriggerType,
+  AndroidImportance,
+} from '@notifee/react-native';
+
+Sound.setCategory('Playback');
 
 export default function App() {
   const initialTimer = { h: 0, m: 0, s: 0, running: false, total: 0 };
-
   const [timers, setTimers] = useState({
     1: { ...initialTimer },
     2: { ...initialTimer },
     3: { ...initialTimer },
     4: { ...initialTimer },
   });
-
   const [selected, setSelected] = useState(1);
+  const beepSoundRef = useRef(null);
 
-  // Track when the timer was last "ticked" or started/paused
-  const lastTickRef = useRef(Date.now());
-  const appStateRef = useRef(AppState.currentState);
-
-  // Recalculate total seconds when h/m/s changes (only when not running)
+  // Initialize Sound for foreground use
   useEffect(() => {
-    setTimers(prev => {
-      const updated = { ...prev };
-      Object.keys(updated).forEach(key => {
-        const t = updated[key];
-        if (!t.running) {
-          updated[key] = {
-            ...t,
-            total: t.h * 3600 + t.m * 60 + t.s,
-          };
-        }
-      });
-      return updated;
-    });
-  }, [
-    timers[1].h,
-    timers[1].m,
-    timers[1].s,
-    timers[2].h,
-    timers[2].m,
-    timers[2].s,
-    timers[3].h,
-    timers[3].m,
-    timers[3].s,
-    timers[4].h,
-    timers[4].m,
-    timers[4].s,
-  ]);
-
-  // Handle app state changes (background ↔ foreground)
-  useEffect(() => {
-    const subscription = AppState.addEventListener('change', nextAppState => {
-      if (
-        appStateRef.current.match(/inactive|background/) &&
-        nextAppState === 'active'
-      ) {
-        // App came back to foreground → catch up the timer
-        const now = Date.now();
-        const elapsedMs = now - lastTickRef.current;
-        const elapsedSec = Math.floor(elapsedMs / 1000);
-
-        setTimers(prev => {
-          const activeKey = Object.keys(prev).find(k => prev[k].running);
-          if (!activeKey) return prev;
-
-          const t = prev[activeKey];
-          let newTotal = Math.max(0, t.total - elapsedSec);
-
-          if (newTotal <= 0) {
-            Alert.alert(
-              "Time's Up!",
-              `Timer T${activeKey} has finished!`,
-              [{ text: 'OK', style: 'default' }],
-              { cancelable: true },
-            );
-            return {
-              ...prev,
-              [activeKey]: { ...initialTimer, running: false },
-            };
-          }
-
-          const newH = Math.floor(newTotal / 3600);
-          const newM = Math.floor((newTotal % 3600) / 60);
-          const newS = newTotal % 60;
-
-          return {
-            ...prev,
-            [activeKey]: {
-              ...t,
-              h: newH,
-              m: newM,
-              s: newS,
-              total: newTotal,
-            },
-          };
-        });
-
-        lastTickRef.current = now; // Reset tick reference
-      } else if (nextAppState === 'background' || nextAppState === 'inactive') {
-        // Going to background → record current time
-        lastTickRef.current = Date.now();
-      }
-
-      appStateRef.current = nextAppState;
-    });
-
-    return () => subscription.remove();
+    beepSoundRef.current = new Sound('beep.wav', Sound.MAIN_BUNDLE);
+    return () => {
+      if (beepSoundRef.current) beepSoundRef.current.release();
+    };
   }, []);
 
-  // Foreground countdown (runs every second while active & in foreground)
+  // Create Notifee Channel on mount
   useEffect(() => {
-    let interval = null;
+    const createChannel = async () => {
+      await notifee.createChannel({
+        id: 'timer-channel',
+        name: 'Timer Alerts',
+        importance: AndroidImportance.HIGH,
+        sound: 'beep', // References res/raw/beep.wav (omit .wav)
+      });
+    };
+    createChannel();
+  }, []);
 
-    const activeTimerKey = Object.keys(timers).find(key => timers[key].running);
-
-    if (activeTimerKey) {
-      interval = setInterval(() => {
-        setTimers(prev => {
-          const t = prev[activeTimerKey];
-          if (t.total <= 0) {
-            Alert.alert(
-              "Time's Up!",
-              `Timer T${activeTimerKey} has finished!`,
-              [{ text: 'OK', style: 'default' }],
-              { cancelable: true },
-            );
-            return {
-              ...prev,
-              [activeTimerKey]: { ...initialTimer, running: false },
-            };
-          }
-
-          const newTotal = t.total - 1;
-          const newH = Math.floor(newTotal / 3600);
-          const newM = Math.floor((newTotal % 3600) / 60);
-          const newS = newTotal % 60;
-
-          lastTickRef.current = Date.now(); // Update on each tick
-
-          return {
-            ...prev,
-            [activeTimerKey]: {
-              ...t,
-              h: newH,
-              m: newM,
-              s: newS,
-              total: newTotal,
-            },
-          };
-        });
-      }, 1000);
+  const playBeep = () => {
+    if (beepSoundRef.current) {
+      beepSoundRef.current.setNumberOfLoops(-1);
+      beepSoundRef.current.play();
     }
+  };
 
+  const stopBeep = () => {
+    if (beepSoundRef.current) beepSoundRef.current.stop();
+    notifee.cancelAllNotifications(); // Clear any pending/active notifications
+  };
+
+  // Schedule Background Notification
+  const scheduleNotification = async (seconds, timerId) => {
+    const date = new Date(Date.now() + seconds * 1000);
+
+    const trigger = {
+      type: TriggerType.TIMESTAMP,
+      timestamp: date.getTime(),
+    };
+
+    await notifee.createTriggerNotification(
+      {
+        id: `timer-${timerId}`,
+        title: 'Industrial Timer Finished',
+        body: `Timer T${timerId} has reached zero!`,
+        android: {
+          channelId: 'timer-channel',
+          importance: AndroidImportance.HIGH,
+          pressAction: { id: 'default' },
+          sound: 'beep', // Must match the filename in res/raw
+        },
+      },
+      trigger,
+    );
+  };
+
+  // Foreground Interval (Same as before)
+  useEffect(() => {
+    const activeKey = Object.keys(timers).find(k => timers[k].running);
+    if (!activeKey) return;
+
+    const interval = setInterval(() => {
+      setTimers(prev => {
+        const t = prev[activeKey];
+        if (t.total <= 1) {
+          playBeep();
+          clearInterval(interval);
+          return { ...prev, [activeKey]: { ...initialTimer, running: false } };
+        }
+        return {
+          ...prev,
+          [activeKey]: {
+            ...t,
+            total: t.total - 1,
+            h: Math.floor((t.total - 1) / 3600),
+            m: Math.floor(((t.total - 1) % 3600) / 60),
+            s: (t.total - 1) % 60,
+          },
+        };
+      });
+    }, 1000);
     return () => clearInterval(interval);
   }, [timers]);
+
+  const toggleRunning = () => {
+    const current = timers[selected];
+    const willRun = !current.running;
+
+    stopBeep();
+
+    if (willRun && current.total > 0) {
+      scheduleNotification(current.total, selected);
+    } else {
+      notifee.cancelNotification(`timer-${selected}`);
+    }
+
+    setTimers(prev => {
+      const updated = { ...prev };
+      Object.keys(updated).forEach(k => {
+        if (k != selected) updated[k].running = false;
+      });
+      updated[selected].running = willRun;
+      return updated;
+    });
+  };
 
   const adjustTime = (unit, delta) => {
     setTimers(prev => {
       const t = prev[selected];
-      if (t.running) return prev; // Optional: prevent changes while running
-
-      let newVal = t[unit] + delta;
-      if (newVal < 0) newVal = 0;
-
-      return {
-        ...prev,
-        [selected]: { ...t, [unit]: newVal },
-      };
+      if (t.running) return prev;
+      let newVal = Math.max(0, t[unit] + delta);
+      const newT = { ...t, [unit]: newVal };
+      newT.total = newT.h * 3600 + newT.m * 60 + newT.s;
+      return { ...prev, [selected]: newT };
     });
-  };
-
-  const toggleRunning = () => {
-    setTimers(prev => {
-      const updated = { ...prev };
-      Object.keys(updated).forEach(key => {
-        if (Number(key) !== selected) {
-          updated[key] = { ...updated[key], running: false };
-        }
-      });
-      const current = updated[selected];
-      const willRun = !current.running;
-
-      if (willRun) {
-        lastTickRef.current = Date.now(); // Reset tick on start
-      }
-
-      return {
-        ...updated,
-        [selected]: { ...current, running: willRun },
-      };
-    });
-  };
-
-  const clearTimer = () => {
-    setTimers(prev => ({
-      ...prev,
-      [selected]: { ...initialTimer },
-    }));
   };
 
   const current = timers[selected];
-  const displayH = String(current.h).padStart(2, '0');
-  const displayM = String(current.m).padStart(2, '0');
-  const displayS = String(current.s).padStart(2, '0');
-
   return (
     <SafeAreaView style={styles.container}>
       <Text style={styles.status}>
-        {current.running ? `TIMER T${selected} ACTIVE` : 'IDLE'}
+        {current.running ? `T${selected} ACTIVE` : 'IDLE'}
       </Text>
-
       <View style={styles.lcd}>
         <Text style={styles.lcdText}>
-          {displayH}:{displayM}:{displayS}
+          {String(current.h).padStart(2, '0')}:
+          {String(current.m).padStart(2, '0')}:
+          {String(current.s).padStart(2, '0')}
         </Text>
       </View>
-
       <View style={styles.row}>
-        {[1, 2, 3, 4].map(num => (
+        {[1, 2, 3, 4].map(n => (
           <TouchableOpacity
-            key={num}
-            onPress={() => setSelected(num)}
-            style={[styles.btnSmall, selected === num && styles.btnSelected]}
+            key={n}
+            onPress={() => {
+              stopBeep();
+              setSelected(n);
+            }}
+            style={[styles.btnSmall, selected === n && styles.btnSelected]}
           >
-            <Text style={styles.white}>T{num}</Text>
+            <Text style={styles.white}>T{n}</Text>
           </TouchableOpacity>
         ))}
       </View>
-
-      <View style={styles.row}>
-        <TouchableOpacity onPress={() => adjustTime('s', 1)} style={styles.btn}>
-          <Text style={styles.white}>Sec +</Text>
-        </TouchableOpacity>
-        <TouchableOpacity
-          onPress={() => adjustTime('s', -1)}
-          style={styles.btn}
-        >
-          <Text style={styles.white}>Sec -</Text>
-        </TouchableOpacity>
-      </View>
-
-      <View style={styles.row}>
-        <TouchableOpacity onPress={() => adjustTime('m', 1)} style={styles.btn}>
-          <Text style={styles.white}>Min +</Text>
-        </TouchableOpacity>
-        <TouchableOpacity
-          onPress={() => adjustTime('m', -1)}
-          style={styles.btn}
-        >
-          <Text style={styles.white}>Min -</Text>
-        </TouchableOpacity>
-      </View>
-
       <View style={styles.row}>
         <TouchableOpacity onPress={() => adjustTime('h', 1)} style={styles.btn}>
           <Text style={styles.white}>Hr +</Text>
@@ -270,12 +184,38 @@ export default function App() {
           <Text style={styles.white}>Hr -</Text>
         </TouchableOpacity>
       </View>
-
       <View style={styles.row}>
-        <TouchableOpacity onPress={clearTimer} style={styles.btnClear}>
+        <TouchableOpacity onPress={() => adjustTime('m', 1)} style={styles.btn}>
+          <Text style={styles.white}>Min +</Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          onPress={() => adjustTime('m', -1)}
+          style={styles.btn}
+        >
+          <Text style={styles.white}>Min -</Text>
+        </TouchableOpacity>
+      </View>
+      <View style={styles.row}>
+        <TouchableOpacity onPress={() => adjustTime('s', 1)} style={styles.btn}>
+          <Text style={styles.white}>Sec +</Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          onPress={() => adjustTime('s', -1)}
+          style={styles.btn}
+        >
+          <Text style={styles.white}>Sec -</Text>
+        </TouchableOpacity>
+      </View>
+      <View style={styles.row}>
+        <TouchableOpacity
+          onPress={() => {
+            stopBeep();
+            setTimers(p => ({ ...p, [selected]: { ...initialTimer } }));
+          }}
+          style={styles.btnClear}
+        >
           <Text style={styles.white}>CLEAR</Text>
         </TouchableOpacity>
-
         <TouchableOpacity
           onPress={toggleRunning}
           style={[
@@ -290,7 +230,6 @@ export default function App() {
   );
 }
 
-// Styles remain the same as before
 const styles = StyleSheet.create({
   container: {
     flex: 1,
@@ -302,8 +241,8 @@ const styles = StyleSheet.create({
     color: '#AAA',
     textAlign: 'center',
     marginBottom: 10,
-    fontWeight: 'bold',
     fontSize: 18,
+    fontWeight: 'bold',
   },
   lcd: {
     backgroundColor: '#111',
@@ -314,11 +253,7 @@ const styles = StyleSheet.create({
     marginBottom: 30,
     alignItems: 'center',
   },
-  lcdText: {
-    color: '#00FF41',
-    fontSize: 70,
-    fontFamily: 'monospace',
-  },
+  lcdText: { color: '#00FF41', fontSize: 70, fontFamily: 'monospace' },
   row: {
     flexDirection: 'row',
     justifyContent: 'space-around',
@@ -327,17 +262,15 @@ const styles = StyleSheet.create({
   btn: {
     backgroundColor: '#333',
     paddingVertical: 14,
-    paddingHorizontal: 20,
-    borderRadius: 10,
     width: '45%',
+    borderRadius: 10,
     alignItems: 'center',
   },
   btnSmall: {
     backgroundColor: '#444',
     paddingVertical: 12,
-    paddingHorizontal: 18,
-    borderRadius: 10,
     width: '22%',
+    borderRadius: 10,
     alignItems: 'center',
   },
   btnSelected: {
@@ -348,9 +281,8 @@ const styles = StyleSheet.create({
   btnClear: {
     backgroundColor: '#555',
     paddingVertical: 18,
-    paddingHorizontal: 30,
-    borderRadius: 10,
     width: '40%',
+    borderRadius: 10,
     alignItems: 'center',
   },
   start: {
@@ -360,9 +292,5 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     borderRadius: 10,
   },
-  white: {
-    color: '#FFF',
-    fontSize: 20,
-    fontWeight: 'bold',
-  },
+  white: { color: '#FFF', fontSize: 20, fontWeight: 'bold' },
 });
