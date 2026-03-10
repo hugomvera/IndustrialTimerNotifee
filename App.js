@@ -6,324 +6,231 @@ import {
   TouchableOpacity,
   SafeAreaView,
   AppState,
+  Platform,
+  PermissionsAndroid,
+  Alert,
 } from 'react-native';
 import Sound from 'react-native-sound';
 import notifee, {
   TriggerType,
   AndroidImportance,
-  EventType,
+  AndroidCategory,
+  AndroidVisibility,
 } from '@notifee/react-native';
 
 Sound.setCategory('Playback');
 
-const initialTimer = {
+const INITIAL_TIMER_STATE = {
   h: 0,
   m: 0,
   s: 0,
-  running: false,
   total: 0,
-  startTimestamp: null,
-  pausedRemaining: 0,
+  running: false,
   alarm: false,
+  targetTime: null,
 };
 
 export default function App() {
   const [timers, setTimers] = useState({
-    1: { ...initialTimer },
-    2: { ...initialTimer },
-    3: { ...initialTimer },
-    4: { ...initialTimer },
+    1: { ...INITIAL_TIMER_STATE },
+    2: { ...INITIAL_TIMER_STATE },
+    3: { ...INITIAL_TIMER_STATE },
+    4: { ...INITIAL_TIMER_STATE },
   });
-
   const [selected, setSelected] = useState(1);
   const [isBlinkVisible, setIsBlinkVisible] = useState(true);
-  const appStateRef = useRef(AppState.currentState);
+
+  const appState = useRef(AppState.currentState);
   const beepSoundRef = useRef(null);
 
-  // Setup sound + Notifee channel + foreground event listener
   useEffect(() => {
-    beepSoundRef.current = new Sound('beep.wav', Sound.MAIN_BUNDLE);
+    async function setup() {
+      if (Platform.OS === 'android' && Platform.Version >= 33) {
+        await PermissionsAndroid.request(
+          PermissionsAndroid.PERMISSIONS.POST_NOTIFICATIONS,
+        );
+      }
+      await notifee.requestPermission();
 
-    const setupNotifee = async () => {
+      // IMPORTANT: Create the channel with the sound name (no extension)
       await notifee.createChannel({
         id: 'timer-channel',
         name: 'Timer Alerts',
         importance: AndroidImportance.HIGH,
-        sound: 'beep',
+        sound: 'beep', // Refers to android/app/src/main/res/raw/beep.wav
+        visibility: AndroidVisibility.PUBLIC,
       });
-    };
-    setupNotifee();
+    }
 
-    // Optional: Handle notification interactions when app is foreground
-    const unsubscribeForeground = notifee.onForegroundEvent(
-      ({ type, detail }) => {
-        switch (type) {
-          case EventType.PRESS:
-            console.log(
-              'Notification pressed while foreground:',
-              detail.notification?.id,
-            );
-            // You could e.g. setSelected based on timer ID from notification id
-            break;
-          case EventType.DISMISSED:
-            console.log('Notification dismissed');
-            break;
-          default:
-            break;
-        }
-      },
-    );
+    const sound = new Sound('beep.wav', Sound.MAIN_BUNDLE, error => {
+      if (!error) beepSoundRef.current = sound;
+    });
 
+    setup();
     return () => {
       if (beepSoundRef.current) beepSoundRef.current.release();
-      unsubscribeForeground();
     };
   }, []);
 
-  // Blinking effect
-  useEffect(() => {
-    const blinkInterval = setInterval(() => {
-      setIsBlinkVisible(prev => !prev);
-    }, 500);
-    return () => clearInterval(blinkInterval);
-  }, []);
+  const playBeepJS = () => {
+    if (beepSoundRef.current) {
+      beepSoundRef.current.setNumberOfLoops(-1);
+      beepSoundRef.current.play();
+    }
+  };
 
-  // Foreground resume: recalc + check expired timers + force alarm if needed
+  const stopAllSounds = () => {
+    if (beepSoundRef.current) beepSoundRef.current.stop();
+  };
+
+  // Sync Engine: Catches up when you re-open the app
   useEffect(() => {
-    const subscription = AppState.addEventListener('change', nextAppState => {
+    const subscription = AppState.addEventListener('change', nextState => {
       if (
-        appStateRef.current.match(/inactive|background/) &&
-        nextAppState === 'active'
+        appState.current.match(/inactive|background/) &&
+        nextState === 'active'
       ) {
         const now = Date.now();
-
-        setTimers(prevTimers => {
-          const updated = { ...prevTimers };
-          let anyChanged = false;
-
+        setTimers(prev => {
+          const updated = { ...prev };
+          let shouldPlayBeep = false;
           Object.keys(updated).forEach(key => {
             const t = updated[key];
-            if (t.running && t.startTimestamp) {
-              const elapsed = Math.floor((now - t.startTimestamp) / 1000);
-              if (elapsed >= t.total) {
-                // Expired while backgrounded → activate alarm
-                notifee.cancelNotification(`timer-${key}`);
-                if (beepSoundRef.current) {
-                  beepSoundRef.current.setNumberOfLoops(-1);
-                  beepSoundRef.current.play(success => {
-                    if (!success) console.log('Sound playback failed');
-                  });
-                }
+            if (t.running && t.targetTime) {
+              const remaining = Math.round((t.targetTime - now) / 1000);
+              if (remaining <= 0) {
                 updated[key] = {
                   ...t,
                   running: false,
-                  startTimestamp: null,
-                  pausedRemaining: 0,
+                  total: 0,
+                  h: 0,
+                  m: 0,
+                  s: 0,
                   alarm: true,
                 };
-                anyChanged = true;
+                shouldPlayBeep = true;
+              } else {
+                updated[key] = {
+                  ...t,
+                  total: remaining,
+                  h: Math.floor(remaining / 3600),
+                  m: Math.floor((remaining % 3600) / 60),
+                  s: remaining % 60,
+                };
               }
             }
           });
-
-          return anyChanged ? updated : { ...prevTimers };
+          if (shouldPlayBeep) playBeepJS();
+          return updated;
         });
       }
-      appStateRef.current = nextAppState;
+      appState.current = nextState;
     });
-
     return () => subscription.remove();
   }, []);
 
-  const playBeep = () => {
-    if (beepSoundRef.current) {
-      beepSoundRef.current.setNumberOfLoops(-1);
-      beepSoundRef.current.play(success => {
-        if (!success) console.log('Sound playback failed');
+  // UI Tick
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setIsBlinkVisible(v => !v);
+      setTimers(prev => {
+        const updated = { ...prev };
+        let changed = false;
+        Object.keys(updated).forEach(key => {
+          const t = updated[key];
+          if (t.running) {
+            changed = true;
+            if (t.total <= 1) {
+              playBeepJS();
+              updated[key] = {
+                ...t,
+                running: false,
+                total: 0,
+                h: 0,
+                m: 0,
+                s: 0,
+                alarm: true,
+              };
+            } else {
+              const nextTotal = t.total - 1;
+              updated[key] = {
+                ...t,
+                total: nextTotal,
+                h: Math.floor(nextTotal / 3600),
+                m: Math.floor((nextTotal % 3600) / 60),
+                s: nextTotal % 60,
+              };
+            }
+          }
+        });
+        return changed ? updated : prev;
       });
-    }
-  };
+    }, 1000);
+    return () => clearInterval(interval);
+  }, []);
 
-  const stopAlarmLogic = timerId => {
-    const otherAlarms = Object.keys(timers).some(
-      k => k !== timerId.toString() && timers[k].alarm,
-    );
-
-    if (!otherAlarms) {
-      if (beepSoundRef.current) beepSoundRef.current.stop();
-      notifee.cancelAllNotifications();
-    }
-
-    setTimers(prev => ({
-      ...prev,
-      [timerId]: { ...prev[timerId], alarm: false },
-    }));
-  };
-
-  const toggleRunning = () => {
-    const current = timers[selected];
-
-    if (current.alarm) {
-      stopAlarmLogic(selected);
+  const toggleRunning = async () => {
+    const t = timers[selected];
+    if (t.alarm) {
+      const others = Object.keys(timers).some(
+        k => k !== selected.toString() && timers[k].alarm,
+      );
+      if (!others) stopAllSounds();
+      notifee.cancelNotification(`timer-${selected}`);
+      setTimers(prev => ({
+        ...prev,
+        [selected]: { ...prev[selected], alarm: false },
+      }));
       return;
     }
 
-    const willRun = !current.running;
+    if (!t.running && t.total > 0) {
+      const target = Date.now() + t.total * 1000;
 
-    if (willRun) {
-      const now = Date.now();
-      const remaining = current.pausedRemaining || current.total;
+      // BACKGROUND ENGINE: Native Notification
+      await notifee.createTriggerNotification(
+        {
+          id: `timer-${selected}`,
+          title: `Timer T${selected} Finished`,
+          body: 'Industrial Alert: Time is up!',
+          android: {
+            channelId: 'timer-channel',
+            importance: AndroidImportance.HIGH,
+            category: AndroidCategory.ALARM,
+            sound: 'beep', // Play natively in background
+            pressAction: { id: 'default' },
+            fullScreenAction: { id: 'default' },
+          },
+        },
+        { type: TriggerType.TIMESTAMP, timestamp: target, alarmManager: true },
+      );
 
       setTimers(prev => ({
         ...prev,
-        [selected]: {
-          ...prev[selected],
-          running: true,
-          startTimestamp: now,
-          pausedRemaining: 0,
-        },
+        [selected]: { ...t, running: true, targetTime: target },
       }));
-
-      if (remaining > 0) {
-        scheduleNotification(remaining, selected);
-      }
     } else {
-      const elapsed = current.startTimestamp
-        ? Math.floor((Date.now() - current.startTimestamp) / 1000)
-        : 0;
-      const remaining = Math.max(0, current.total - elapsed);
-
       notifee.cancelNotification(`timer-${selected}`);
-
       setTimers(prev => ({
         ...prev,
-        [selected]: {
-          ...prev[selected],
-          running: false,
-          pausedRemaining: remaining,
-          startTimestamp: null,
-        },
+        [selected]: { ...t, running: false, targetTime: null },
       }));
     }
-  };
-
-  const clearTimer = () => {
-    const current = timers[selected];
-    if (current.alarm) {
-      stopAlarmLogic(selected);
-    }
-    notifee.cancelNotification(`timer-${selected}`);
-
-    setTimers(prev => ({
-      ...prev,
-      [selected]: { ...initialTimer },
-    }));
-  };
-
-  const scheduleNotification = async (seconds, timerId) => {
-    const trigger = {
-      type: TriggerType.TIMESTAMP,
-      timestamp: Date.now() + seconds * 1000,
-      alarmManager: {
-        allowWhileIdle: true, // Helps on Samsung / Doze mode
-      },
-    };
-
-    await notifee.createTriggerNotification(
-      {
-        id: `timer-${timerId}`,
-        title: `Timer T${timerId} Finished`,
-        body: 'Industrial Alert: Time is up!',
-        android: {
-          channelId: 'timer-channel',
-          importance: AndroidImportance.HIGH,
-          sound: 'beep',
-          looping: true,
-        },
-      },
-      trigger,
-    );
   };
 
   const adjustTime = (unit, delta) => {
     setTimers(prev => {
       const t = prev[selected];
       if (t.running || t.alarm) return prev;
-
-      let newVal = Math.max(0, t[unit] + delta);
+      const newVal = Math.max(0, t[unit] + delta);
       const updated = { ...t, [unit]: newVal };
       updated.total = updated.h * 3600 + updated.m * 60 + updated.s;
-      updated.pausedRemaining = updated.total;
-
       return { ...prev, [selected]: updated };
     });
   };
 
-  // Selected timer's current display values
   const current = timers[selected];
-  let displayTotal = current.total;
-  let displayH = current.h;
-  let displayM = current.m;
-  let displayS = current.s;
-
-  if (current.running && current.startTimestamp) {
-    const elapsed = Math.floor((Date.now() - current.startTimestamp) / 1000);
-    displayTotal = Math.max(0, current.total - elapsed);
-
-    displayH = Math.floor(displayTotal / 3600);
-    displayM = Math.floor((displayTotal % 3600) / 60);
-    displayS = displayTotal % 60;
-
-    if (displayTotal <= 0 && !current.alarm) {
-      notifee.cancelNotification(`timer-${selected}`);
-      playBeep();
-      setTimers(prev => ({
-        ...prev,
-        [selected]: {
-          ...prev[selected],
-          running: false,
-          startTimestamp: null,
-          pausedRemaining: 0,
-          alarm: true,
-        },
-      }));
-    }
-  } else if (!current.running && current.pausedRemaining > 0) {
-    displayTotal = current.pausedRemaining;
-    displayH = Math.floor(displayTotal / 3600);
-    displayM = Math.floor((displayTotal % 3600) / 60);
-    displayS = displayTotal % 60;
-  }
-
-  const renderTime = () => {
-    const hh = String(displayH).padStart(2, '0');
-    const mm = String(displayM).padStart(2, '0');
-    const ss = String(displayS).padStart(2, '0');
-
-    const showRed = current.alarm && isBlinkVisible;
-    const textColor = showRed ? '#FF0000' : '#00FF41';
-
-    if (displayH > 0 || current.alarm) {
-      return (
-        <Text
-          style={[styles.lcdText, styles.lcdSmall, { color: textColor }]}
-          numberOfLines={1}
-          adjustsFontSizeToFit
-        >
-          {hh}:{mm}:{ss}
-        </Text>
-      );
-    }
-    return (
-      <Text
-        style={[styles.lcdText, styles.lcdLarge, { color: textColor }]}
-        numberOfLines={1}
-        adjustsFontSizeToFit
-      >
-        {mm}:{ss}
-      </Text>
-    );
-  };
+  const textColor = current.alarm && isBlinkVisible ? '#FF0000' : '#00FF41';
 
   return (
     <SafeAreaView style={styles.container}>
@@ -337,46 +244,54 @@ export default function App() {
             : 'IDLE'}
         </Text>
       </View>
-
       <View
         style={[
           styles.lcd,
           current.alarm && isBlinkVisible && styles.lcdAlarmBorder,
         ]}
       >
-        {renderTime()}
+        <Text
+          style={[
+            styles.lcdText,
+            current.h > 0 ? styles.lcdSmall : styles.lcdLarge,
+            { color: textColor },
+          ]}
+        >
+          {current.h > 0
+            ? `${String(current.h).padStart(2, '0')}:${String(
+                current.m,
+              ).padStart(2, '0')}:${String(current.s).padStart(2, '0')}`
+            : `${String(current.m).padStart(2, '0')}:${String(
+                current.s,
+              ).padStart(2, '0')}`}
+        </Text>
       </View>
-
       <View style={styles.row}>
-        {[1, 2, 3, 4].map(n => {
-          const t = timers[n];
-          const isAlarming = t.alarm;
-          const isSelected = selected === n;
-          let bgColor = '#444';
-          if (isSelected) bgColor = '#0066cc';
-          if (isAlarming && isBlinkVisible) bgColor = '#FF0000';
-
-          return (
-            <TouchableOpacity
-              key={n}
-              onPress={() => setSelected(n)}
-              style={[
-                styles.btnSmall,
-                { backgroundColor: bgColor },
-                isSelected && styles.btnSelectedBorder,
-              ]}
-            >
-              <Text style={styles.white}>T{n}</Text>
-              {t.running && !t.alarm && (
-                <View style={styles.runningIndicator} />
-              )}
-            </TouchableOpacity>
-          );
-        })}
+        {[1, 2, 3, 4].map(n => (
+          <TouchableOpacity
+            key={n}
+            onPress={() => setSelected(n)}
+            style={[
+              styles.btnSmall,
+              {
+                backgroundColor:
+                  selected === n
+                    ? '#0066cc'
+                    : timers[n].alarm && isBlinkVisible
+                    ? '#FF0000'
+                    : '#444',
+              },
+            ]}
+          >
+            <Text style={styles.white}>T{n}</Text>
+            {timers[n].running && !timers[n].alarm && (
+              <View style={styles.runningIndicator} />
+            )}
+          </TouchableOpacity>
+        ))}
       </View>
-
       <View style={styles.controlSection}>
-        {['s', 'm', 'h'].map(unit => (
+        {['h', 'm', 's'].map(unit => (
           <View key={unit} style={styles.adjustmentRow}>
             <Text style={styles.unitLabel}>{unit.toUpperCase()}</Text>
             <TouchableOpacity
@@ -394,12 +309,16 @@ export default function App() {
           </View>
         ))}
       </View>
-
       <View style={styles.footerRow}>
-        <TouchableOpacity onPress={clearTimer} style={styles.btnClear}>
+        <TouchableOpacity
+          onPress={() => {
+            if (current.alarm) stopAllSounds();
+            setTimers(p => ({ ...p, [selected]: { ...INITIAL_TIMER_STATE } }));
+          }}
+          style={styles.btnClear}
+        >
           <Text style={styles.white}>CLEAR</Text>
         </TouchableOpacity>
-
         <TouchableOpacity
           onPress={toggleRunning}
           style={[
@@ -437,10 +356,12 @@ const styles = StyleSheet.create({
     marginBottom: 20,
     justifyContent: 'center',
     alignItems: 'center',
-    paddingHorizontal: 10,
   },
   lcdAlarmBorder: { borderColor: '#FF0000' },
-  lcdText: { fontFamily: 'monospace', textAlign: 'center' },
+  lcdText: {
+    fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
+    textAlign: 'center',
+  },
   lcdLarge: { fontSize: 90, fontWeight: 'bold' },
   lcdSmall: { fontSize: 65 },
   row: {
@@ -453,9 +374,7 @@ const styles = StyleSheet.create({
     width: '22%',
     borderRadius: 10,
     alignItems: 'center',
-    position: 'relative',
   },
-  btnSelectedBorder: { borderWidth: 2, borderColor: '#3399ff' },
   runningIndicator: {
     position: 'absolute',
     top: 5,
